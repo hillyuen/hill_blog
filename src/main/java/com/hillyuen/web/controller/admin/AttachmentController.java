@@ -1,5 +1,6 @@
 package com.hillyuen.web.controller.admin;
 
+import com.hillyuen.constant.FileUploadEventType;
 import com.hillyuen.model.domain.Logs;
 import com.hillyuen.model.dto.Result;
 import com.hillyuen.model.enums.ResultCode;
@@ -11,6 +12,8 @@ import com.hillyuen.model.dto.HaloConst;
 import com.hillyuen.model.dto.LogsRecord;
 import cn.hutool.core.date.DateUtil;
 import cn.hutool.extra.servlet.ServletUtil;
+import com.hillyuen.utils.qiniu.FileUploadEvent;
+import com.hillyuen.utils.qiniu.QnUploadListener;
 import lombok.extern.slf4j.Slf4j;
 import net.coobird.thumbnailator.Thumbnails;
 import org.apache.commons.lang3.StringUtils;
@@ -48,6 +51,11 @@ public class AttachmentController {
 
     @Autowired
     private LogsService logsService;
+
+    @Autowired
+    private QnUploadListener qnUploadListener;
+
+    private static final String QN_CND_DOMAIN = "http://cnd.img.hillyuen.com";
 
     /**
      * 刷新HaloConst
@@ -108,7 +116,7 @@ public class AttachmentController {
     @ResponseBody
     public Map<String, Object> upload(@RequestParam("file") MultipartFile file,
                                       HttpServletRequest request) {
-        return uploadAttachment(file, request);
+        return uploadAttachmentByQn(file, request);
     }
 
     /**
@@ -122,7 +130,87 @@ public class AttachmentController {
     @ResponseBody
     public Map<String, Object> editorUpload(@RequestParam("editormd-image-file") MultipartFile file,
                                             HttpServletRequest request) {
-        return uploadAttachment(file, request);
+        return uploadAttachmentByQn(file, request);
+    }
+
+    /**
+     * 上传图片
+     *
+     * @param file    file
+     * @param request request
+     * @return Map
+     */
+    private Map<String, Object> uploadAttachmentByQn(MultipartFile file, HttpServletRequest request) {
+        Map<String, Object> result = new HashMap<String, Object>();
+        if (!file.isEmpty()) {
+            try {
+                //程序根路径，也就是/resources
+                File basePath = new File(ResourceUtils.getURL("classpath:").getPath());
+                //upload的路径
+                StringBuffer sbMedia = new StringBuffer("upload/");
+                //获取当前年月以创建目录，如果没有该目录则创建
+                sbMedia.append(HillUtils.YEAR).append("/").append(HillUtils.MONTH).append("/");
+                // 根目录
+                File mediaPath = new File(basePath.getAbsolutePath(), sbMedia.toString());
+                if (!mediaPath.exists()) {
+                    mediaPath.mkdirs();
+                }
+                SimpleDateFormat dateFormat = new SimpleDateFormat("yyyyMMddHHmmss");
+                String nameWithOutSuffix = file.getOriginalFilename().substring(0, file.getOriginalFilename().lastIndexOf('.')).replaceAll(" ","_").replaceAll(",","")+dateFormat.format(DateUtil.date())+new Random().nextInt(1000);
+                String fileSuffix = file.getOriginalFilename().substring(file.getOriginalFilename().lastIndexOf('.') + 1);
+                String fileName = nameWithOutSuffix+"."+fileSuffix;
+                String smallFileName = nameWithOutSuffix+"_small."+fileSuffix;
+                File toFile = new File(mediaPath.getAbsoluteFile(), fileName);
+                file.transferTo(toFile);
+
+                //压缩图片
+                Thumbnails.of(new StringBuffer(mediaPath.getAbsolutePath()).append("/").append(fileName).toString()).size(256,256).keepAspectRatio(false).toFile(new StringBuffer(mediaPath.getAbsolutePath()).append("/").append(nameWithOutSuffix).append("_small.").append(fileSuffix).toString());
+
+                // 文件存储相对路径
+                String attachPath = new StringBuffer("/upload/").append(HillUtils.YEAR).append("/").append(HillUtils.MONTH).append("/").append(fileName).toString();
+                // 压缩图片存储相对路径
+                String attachSmallPath = new StringBuffer("/upload/").append(HillUtils.YEAR).append("/").append(HillUtils.MONTH).append("/").append(smallFileName).toString();
+                // 封装实体保存在数据库
+                Attachment attachment = new Attachment();
+                attachment.setAttachName(fileName);
+                attachment.setAttachPath(QN_CND_DOMAIN + attachPath);
+                attachment.setAttachSmallPath(QN_CND_DOMAIN + attachSmallPath);
+                attachment.setAttachType(file.getContentType());
+                attachment.setAttachSuffix(new StringBuffer(".").append(fileSuffix).toString());
+                attachment.setAttachCreated(DateUtil.date());
+                attachment.setAttachSize(HillUtils.parseSize(new File(mediaPath,fileName).length()));
+                attachment.setAttachWh(HillUtils.getImageWh(new File(mediaPath,fileName)));
+                attachmentService.saveByAttachment(attachment);
+                updateConst();
+                log.info("上传文件[" + fileName + "]到[" + mediaPath.getAbsolutePath() + "]成功");
+                logsService.saveByLogs(
+                        new Logs(LogsRecord.UPLOAD_FILE, fileName, ServletUtil.getClientIP(request), DateUtil.date())
+                );
+                // 触发七牛文件监听
+                FileUploadEvent event = new FileUploadEvent();
+                event.setEventType(FileUploadEventType.FILE_UPLOAD.getType());
+                event.setFile(toFile);
+                event.setFilePath(attachPath);
+                qnUploadListener.onEvent(event);
+                // 触发压缩图上传文件监听
+                File smallFile = new File(mediaPath.getAbsoluteFile(), smallFileName);
+                event.setFilePath(attachSmallPath);
+                event.setFile(smallFile);
+                qnUploadListener.onEvent(event);
+
+                result.put("success", 1);
+                result.put("message", "上传成功！");
+                result.put("url", attachment.getAttachPath());
+            } catch (Exception e) {
+                log.error("上传文件失败：{}", e.getMessage());
+                e.printStackTrace();
+                result.put("success", 0);
+                result.put("message", "上传失败！");
+            }
+        } else {
+            log.error("文件不能为空");
+        }
+        return result;
     }
 
 
